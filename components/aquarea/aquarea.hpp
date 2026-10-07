@@ -53,16 +53,20 @@ enum Registers
   ServiceMode = 142, // 0x02 - pump speed
   ReqMode = 144,
   PumpSpeed = 147,
-  // Settings 192; // -> 0x1 room thermo, 0x80, anitfreeze, 0x04 solar prio, 0x40 cool prio, 0x08 heat prio, 0x10 steril
-  // HeatInterval 193; // -> 1 == 30min, 20 == 10h
-  // TankInterval 194; // in min
-  // BoosterDelay 195; // in min
-  // SterilTemp 196;
-  // SterilTime 197; // in min
-  // SettingsCont 198; // -> 0x04 booster, 0x08 bpan
-  // AutoToCoolTemp 199;
-  // AutoToHeatTemp 200;
-  // UnknownCommand 255;
+  // Installer-menu registers. The heat pump never broadcasts them: it only
+  // echoes one back after it has been written. Verified on a WH-MDC05F3E5:
+  // writing 195 or 198 is acknowledged by a 0x55 frame carrying the value,
+  // and clearing bit 0x04 of 198 does disable the tank booster heater.
+  Settings = 192,      // -> 0x1 room thermo, 0x80 antifreeze, 0x04 solar prio, 0x40 cool prio, 0x08 heat prio, 0x10 steril
+  HeatInterval = 193,  // -> 1 == 30min, 20 == 10h
+  TankInterval = 194,  // in min
+  BoosterDelay = 195,  // in min
+  SterilTemp = 196,
+  SterilTime = 197,    // in min
+  SettingsCont = 198,  // -> 0x04 booster, 0x08 bpan
+  AutoToCoolTemp = 199,
+  AutoToHeatTemp = 200,
+  // UnknownCommand 255; -- out of range, see the bound in heatpump_update
   Num
 };
 
@@ -95,6 +99,8 @@ protected:
     SUB_TEXT_SENSOR(current_mode);
     SUB_BUTTON(reset_error);
     SUB_SWITCH(force);
+    SUB_SWITCH(booster_heater_enable);   // bit 0x04 of 198
+    SUB_SWITCH(sterilization_enable);    // bit 0x10 of 192
     SUB_NUMBER(heat_out_temp_low);
     SUB_NUMBER(heat_out_temp_high);
     SUB_NUMBER(heat_water_temp_low);
@@ -105,9 +111,32 @@ protected:
     SUB_NUMBER(tank_setpoint_temp);
     SUB_NUMBER(shift_setpoint_temp);
     SUB_NUMBER(pump_speed);
+    SUB_NUMBER(settings_raw);    // raw byte 192
+    SUB_NUMBER(heat_interval);   // 193
+    SUB_NUMBER(tank_interval);   // 194
+    SUB_NUMBER(booster_delay);   // 195
+    SUB_NUMBER(steril_temp);     // 196
+    SUB_NUMBER(steril_time);     // 197
+    SUB_NUMBER(settings_cont);   // raw byte 198
     SUB_SELECT(request_mode);
 
   std::queue<std::pair<uint8_t /*register*/, uint8_t /* value */>> write_queue;
+
+  uint8_t settings_octet = 0, settings_cont_octet = 0;
+  bool settings_vu = false, settings_cont_vu = false;
+
+  void ecrire_bit(const Registers& reg, uint8_t masque, bool pose)
+  {
+    uint8_t* octet = (reg == Registers::Settings) ? &settings_octet : &settings_cont_octet;
+    const bool vu = (reg == Registers::Settings) ? settings_vu : settings_cont_vu;
+    if(!vu)
+    {
+      ESP_LOGW("aquarea", "register %d never seen, write the raw byte once first", (int)reg);
+      return;
+    }
+    write_queue.push(std::make_pair(reg, pose ? (*octet | masque) : (*octet & (uint8_t)~masque)));
+  }
+
 private:
   struct Power
   {
@@ -232,6 +261,21 @@ private:
         });
   }
 
+  // 192 and 198 are bit fields and a write carries the whole byte, so a bit
+  // can only be set once the byte is known. The heat pump never broadcasts
+  // them, it only echoes a write, so until something has been written the
+  // switches refuse to act rather than guess the other bits.
+  // Like register_number_if_present, without the signed cast: a bit field
+  // would read negative as soon as bit 0x80 is set.
+  void register_raw_number_if_present(const Registers& reg, number::Number* number)
+  {
+    if(number)
+      registers[reg] = std::move([number = number](uint8_t value)
+        {
+          number->publish_state(value);
+        });
+  }
+
   void setup_registers_cbk()
   {
     static const std::vector<std::pair<binary_sensor::BinarySensor*, uint8_t>> defrost_reg_sensors({{defrost_binary_sensor_, 64}, {booster_binary_sensor_, 2}});
@@ -259,6 +303,24 @@ private:
     register_number_if_present(Registers::TankSetpointTemp, tank_setpoint_temp_number_);
     register_number_if_present(Registers::ShiftSetpoint, shift_setpoint_temp_number_);
     register_number_if_present(Registers::PumpSpeed, pump_speed_number_, [](uint8_t value){ return value*16; });
+    // Installer menu
+    register_raw_number_if_present(Registers::HeatInterval, heat_interval_number_);
+    register_raw_number_if_present(Registers::TankInterval, tank_interval_number_);
+    register_raw_number_if_present(Registers::BoosterDelay, booster_delay_number_);
+    register_raw_number_if_present(Registers::SterilTemp, steril_temp_number_);
+    register_raw_number_if_present(Registers::SterilTime, steril_time_number_);
+    registers[Registers::Settings] = std::move([this](uint8_t value)
+      {
+        settings_octet = value; settings_vu = true;
+        if(settings_raw_number_) settings_raw_number_->publish_state(value);
+        if(sterilization_enable_switch_) sterilization_enable_switch_->publish_state(value & 0x10);
+      });
+    registers[Registers::SettingsCont] = std::move([this](uint8_t value)
+      {
+        settings_cont_octet = value; settings_cont_vu = true;
+        if(settings_cont_number_) settings_cont_number_->publish_state(value);
+        if(booster_heater_enable_switch_) booster_heater_enable_switch_->publish_state(value & 0x04);
+      });
     register_select_if_present(Registers::ReqMode, request_mode_select_, std::bind(&AquareaComponent::get_current_mode, this, std::placeholders::_1));
   }
 
@@ -303,6 +365,11 @@ private:
             delay(1);
             heatpump_write();
           }
+        }
+        else
+        {
+          // Remote -> heat pump frames, otherwise read and dropped silently.
+          ESP_LOGV("aquarea", "cmd %x %x %x %x", rx_packet[0], rx_packet[1], rx_packet[2], rx_packet[3]);
         }
         rx_packet.clear();
       }
@@ -365,7 +432,10 @@ private:
 
   void heatpump_update(uint8_t reg, uint8_t value)
   {
-    if(registers[reg])
+    // reg comes from the frame and can be up to 255 while the table only has
+    // Registers::Num entries -- without this bound, an unmapped register the
+    // pump emits (255 is sent at every start-up) reads past the end.
+    if(reg < Registers::Num && registers[reg])
       registers[reg](value);
   }
 
@@ -483,6 +553,100 @@ protected:
   {
     ESP_LOGD("aquarea", "ShiftSetpointTempNumber");
     parent_->write_queue.push(std::make_pair(Registers::ShiftSetpoint, value));
+  }
+};
+
+// Installer-menu switches. They set one bit of an already known byte; if the
+// byte has never been seen, ecrire_bit refuses and logs a warning.
+class BoosterHeaterEnableSwitch : public switch_::Switch, public Parented<AquareaComponent>
+{
+protected:
+  void write_state(bool state) override
+  {
+    ESP_LOGD("aquarea", "BoosterHeaterEnableSwitch %d", state);
+    parent_->ecrire_bit(Registers::SettingsCont, 0x04, state);
+  }
+};
+
+class SterilizationEnableSwitch : public switch_::Switch, public Parented<AquareaComponent>
+{
+protected:
+  void write_state(bool state) override
+  {
+    ESP_LOGD("aquarea", "SterilizationEnableSwitch %d", state);
+    parent_->ecrire_bit(Registers::Settings, 0x10, state);
+  }
+};
+
+// Installer-menu numbers, raw bytes. Give them no initial_value: they must
+// never write at boot, since the current value cannot be read back.
+class BoosterDelayNumber : public number::Number, public Parented<AquareaComponent>
+{
+protected:
+  void control(float value) override
+  {
+    ESP_LOGD("aquarea", "BoosterDelayNumber");
+    parent_->write_queue.push(std::make_pair(Registers::BoosterDelay, value));
+  }
+};
+
+class SettingsContNumber : public number::Number, public Parented<AquareaComponent>
+{
+protected:
+  void control(float value) override
+  {
+    ESP_LOGD("aquarea", "SettingsContNumber");
+    parent_->write_queue.push(std::make_pair(Registers::SettingsCont, value));
+  }
+};
+
+class SettingsRawNumber : public number::Number, public Parented<AquareaComponent>
+{
+protected:
+  void control(float value) override
+  {
+    ESP_LOGD("aquarea", "SettingsRawNumber");
+    parent_->write_queue.push(std::make_pair(Registers::Settings, value));
+  }
+};
+
+class HeatIntervalNumber : public number::Number, public Parented<AquareaComponent>
+{
+protected:
+  void control(float value) override
+  {
+    ESP_LOGD("aquarea", "HeatIntervalNumber");
+    parent_->write_queue.push(std::make_pair(Registers::HeatInterval, value));
+  }
+};
+
+class TankIntervalNumber : public number::Number, public Parented<AquareaComponent>
+{
+protected:
+  void control(float value) override
+  {
+    ESP_LOGD("aquarea", "TankIntervalNumber");
+    parent_->write_queue.push(std::make_pair(Registers::TankInterval, value));
+  }
+};
+
+class SterilTempNumber : public number::Number, public Parented<AquareaComponent>
+{
+protected:
+  void control(float value) override
+  {
+    ESP_LOGD("aquarea", "SterilTempNumber");
+    parent_->write_queue.push(std::make_pair(Registers::SterilTemp, value));
+  }
+};
+
+class SterilTimeNumber : public number::Number, public Parented<AquareaComponent>
+{
+protected:
+  void control(float value) override
+  {
+    ESP_LOGD("aquarea", "SterilTimeNumber");
+    parent_->write_queue.push(std::make_pair(Registers::SterilTime, value));
   }
 };
 

@@ -20,6 +20,14 @@ CoolSetpointTempNumber = aquarea_ns.class_("CoolSetpointTempNumber", number.Numb
 TankSetpointTempNumber = aquarea_ns.class_("TankSetpointTempNumber", number.Number)
 ShiftSetpointTempNumber = aquarea_ns.class_("ShiftSetpointTempNumber", number.Number)
 PumpSpeedNumber = aquarea_ns.class_("PumpSpeedNumber", number.Number)
+# Installer-menu registers
+BoosterDelayNumber = aquarea_ns.class_("BoosterDelayNumber", number.Number)
+SettingsContNumber = aquarea_ns.class_("SettingsContNumber", number.Number)
+SettingsRawNumber = aquarea_ns.class_("SettingsRawNumber", number.Number)
+HeatIntervalNumber = aquarea_ns.class_("HeatIntervalNumber", number.Number)
+TankIntervalNumber = aquarea_ns.class_("TankIntervalNumber", number.Number)
+SterilTempNumber = aquarea_ns.class_("SterilTempNumber", number.Number)
+SterilTimeNumber = aquarea_ns.class_("SterilTimeNumber", number.Number)
 
 CONF_HeatOutsideTempLow = ("heat_out_temp_low", -20, 5, 1)
 CONF_HeatOutsideTempHigh = ("heat_out_temp_high", -5, 15, 1)
@@ -31,6 +39,13 @@ CONF_CoolSetpointTemp = ("cool_setpoint_temp", 13, 20, 1)
 CONF_TankSetpointTemp = ("tank_setpoint_temp", 40, 70, 1)
 CONF_ShiftSetpointTemp = ("shift_setpoint_temp", -5, 5, 1)
 CONF_PumpSpeed = ("pump_speed", 1, 7, 1)
+CONF_BoosterDelay = ("booster_delay", 20, 95, 5)     # 195, minutes
+CONF_SettingsCont = ("settings_cont", 0, 255, 1)     # 198, raw byte
+CONF_SettingsRaw  = ("settings_raw", 0, 255, 1)      # 192, raw byte
+CONF_HeatInterval = ("heat_interval", 1, 20, 1)      # 193, 1 = 30 min ... 20 = 10 h
+CONF_TankInterval = ("tank_interval", 5, 95, 5)      # 194, minutes
+CONF_SterilTemp   = ("steril_temp", 40, 75, 1)       # 196, degrees
+CONF_SterilTime   = ("steril_time", 5, 60, 5)        # 197, minutes
 
 TYPES = [
     CONF_HeatOutsideTempLow,
@@ -42,7 +57,14 @@ TYPES = [
     CONF_CoolSetpointTemp,
     CONF_TankSetpointTemp,
     CONF_ShiftSetpointTemp,
-    CONF_PumpSpeed
+    CONF_PumpSpeed,
+    CONF_BoosterDelay,
+    CONF_SettingsCont,
+    CONF_SettingsRaw,
+    CONF_HeatInterval,
+    CONF_TankInterval,
+    CONF_SterilTemp,
+    CONF_SterilTime
 ]
 
 def ensure_within_range(value, config):
@@ -124,6 +146,38 @@ CONFIG_SCHEMA = cv.All(
             ).extend({
                 cv.Optional(CONF_INITIAL_VALUE): cv.All(cv.float_, lambda v: ensure_within_range(v, CONF_PumpSpeed)),
             }),
+            # No CONF_INITIAL_VALUE on the installer-menu registers: their
+            # current value cannot be read back, so writing one at boot would
+            # overwrite settings with a guess.
+            cv.Optional(CONF_BoosterDelay[0]): number.number_schema(
+                BoosterDelayNumber,
+                icon=ICON_GAUGE,
+            ),
+            cv.Optional(CONF_SettingsCont[0]): number.number_schema(
+                SettingsContNumber,
+                icon=ICON_GAUGE,
+            ),
+            cv.Optional(CONF_SettingsRaw[0]): number.number_schema(
+                SettingsRawNumber,
+                icon=ICON_GAUGE,
+            ),
+            cv.Optional(CONF_HeatInterval[0]): number.number_schema(
+                HeatIntervalNumber,
+                icon=ICON_GAUGE,
+            ),
+            cv.Optional(CONF_TankInterval[0]): number.number_schema(
+                TankIntervalNumber,
+                icon=ICON_GAUGE,
+            ),
+            cv.Optional(CONF_SterilTemp[0]): number.number_schema(
+                SterilTempNumber,
+                icon=ICON_THERMOMETER,
+                unit_of_measurement=UNIT_CELSIUS,
+            ),
+            cv.Optional(CONF_SterilTime[0]): number.number_schema(
+                SterilTimeNumber,
+                icon=ICON_GAUGE,
+            ),
         }
     ).extend(cv.COMPONENT_SCHEMA)
 )
@@ -134,7 +188,9 @@ async def setup_conf(config, key, hub):
         nr = await number.new_number(number_config, min_value=key[1], max_value=key[2], step=key[3])
         cg.add(getattr(hub, f"set_{key[0]}_number")(nr))
         await cg.register_parented(nr, config[CONF_AQUAREA_ID])
-        cg.add(nr.make_call().set_value(number_config[CONF_INITIAL_VALUE]).perform())
+        # initial_value is declared Optional, so only write it when given
+        if CONF_INITIAL_VALUE in number_config:
+            cg.add(nr.make_call().set_value(number_config[CONF_INITIAL_VALUE]).perform())
 
 async def to_code(config):
     hub = await cg.get_variable(config[CONF_AQUAREA_ID])
